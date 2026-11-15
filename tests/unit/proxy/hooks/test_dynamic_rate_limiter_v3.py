@@ -1338,6 +1338,7 @@ async def test_async_log_success_event_increments_by_actual_tokens(monkeypatch):
     mock_response.usage.prompt_tokens = 10
     mock_response.usage.completion_tokens = 50
     mock_response.usage.total_tokens = 60
+    mock_response.usage.prompt_tokens_details = None
 
     # Create kwargs with priority in user_api_key_auth_metadata
     kwargs = {
@@ -1513,6 +1514,7 @@ async def test_async_log_success_event_uses_team_priority_from_auth_metadata(mon
     mock_response.usage.prompt_tokens = 10
     mock_response.usage.completion_tokens = 20
     mock_response.usage.total_tokens = 30
+    mock_response.usage.prompt_tokens_details = None
 
     # Simulate team metadata inheritance: priority is in user_api_key_auth_metadata
     # This is how the proxy passes team metadata to the callback
@@ -1819,3 +1821,140 @@ async def test_post_call_success_hook_priority_header_is_always_http_encodable(t
     http_response = Response(headers={key: str(value) for key, value in additional_headers.items()})
     assert http_response.headers.get("x-litellm-priority") == expected_priority_header
     assert http_response.headers["x-litellm-rate-limiter-version"] == "v3"
+
+
+def _success_event_handler(
+    model: str, rate_limit_type: str
+) -> tuple[DynamicRateLimitHandler, list[tuple[object, int]]]:
+    """A handler whose token increments are recorded, counting tokens as ``rate_limit_type``."""
+    handler = DynamicRateLimitHandler(internal_usage_cache=DualCache())
+    handler.update_variables(
+        llm_router=Router(
+            model_list=[
+                {
+                    "model_name": model,
+                    "litellm_params": {
+                        "model": "gpt-3.5-turbo",
+                        "api_key": "test-key",
+                        "api_base": "test-base",
+                        "tpm": 1000,
+                    },
+                }
+            ]
+        )
+    )
+    increments: list[tuple[object, int]] = []
+
+    async def record(pipeline_operations, parent_otel_span=None):
+        increments.extend((op.counter, op.amount) for op in pipeline_operations)
+
+    handler.v3_limiter.async_increment_tokens_with_ttl_preservation = record
+    handler.v3_limiter.get_rate_limit_type = lambda: rate_limit_type
+    return handler, increments
+
+
+async def _log_success(handler: DynamicRateLimitHandler, model: str, response_obj: object) -> None:
+    await handler.async_log_success_event(
+        kwargs={
+            "standard_logging_object": {"metadata": {"user_api_key_auth_metadata": {}}},
+            "litellm_params": {"metadata": {"model_group": model}},
+        },
+        response_obj=response_obj,
+        start_time=None,
+        end_time=None,
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("rate_limit_type", "expected"),
+    [("input", 100), ("total", 110), ("output", 10)],
+)
+async def test_async_log_success_event_counts_tokens_as_the_v3_limiter_does(rate_limit_type, expected):
+    """The saturation and priority counters take what the TPM windows take: input and total
+    leave the prompt's cache reads out, as parallel_request_limiter_v3 counts them."""
+    from litellm.types.utils import ModelResponse, PromptTokensDetailsWrapper, Usage
+
+    model = "test-uncached-input"
+    handler, increments = _success_event_handler(model, rate_limit_type)
+    usage = Usage(
+        prompt_tokens=1000,
+        completion_tokens=10,
+        total_tokens=1010,
+        prompt_tokens_details=PromptTokensDetailsWrapper(cached_tokens=900),
+    )
+
+    await _log_success(handler, model, ModelResponse(model=model, usage=usage))
+
+    assert sorted(amount for _, amount in increments) == [expected, expected]
+    assert handler.v3_limiter._get_total_tokens_from_usage(usage=usage, rate_limit_type=rate_limit_type) == expected
+
+
+@pytest.mark.asyncio
+async def test_async_log_success_event_counts_a_v1_messages_call_as_anthropic_counts_input():
+    """A /v1/messages call reaches the hook as the ModelResponse its logging builds from Anthropic's
+    usage block, whose prompt_tokens holds the cache reads and writes: the input counted is new
+    input plus cache writes, Anthropic's input-token unit."""
+    from litellm.llms.anthropic.chat.transformation import AnthropicConfig
+    from litellm.types.utils import ModelResponse
+
+    model = "test-anthropic-messages"
+    handler, increments = _success_event_handler(model, "input")
+    usage = AnthropicConfig().calculate_usage(
+        {"input_tokens": 40, "cache_creation_input_tokens": 60, "cache_read_input_tokens": 900, "output_tokens": 10},
+        reasoning_content=None,
+    )
+
+    await _log_success(handler, model, ModelResponse(model=model, usage=usage))
+
+    assert [amount for _, amount in increments] == [100, 100]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("usage_block", "expected"),
+    [
+        # Anthropic's own shape: input_tokens holds neither cache reads nor writes.
+        (
+            {
+                "input_tokens": 40,
+                "cache_creation_input_tokens": 60,
+                "cache_read_input_tokens": 900,
+                "output_tokens": 10,
+            },
+            100,
+        ),
+        ({"input_tokens": 40, "cache_read_input_tokens": 900, "output_tokens": 10}, 40),
+        # OpenAI's shape: prompt_tokens holds the cache reads that cached_tokens names.
+        (
+            {
+                "prompt_tokens": 1000,
+                "completion_tokens": 10,
+                "total_tokens": 1010,
+                "prompt_tokens_details": {"cached_tokens": 900},
+            },
+            100,
+        ),
+        # The Responses API's shape: input_tokens holds the cache reads that cached_tokens names.
+        (
+            {
+                "input_tokens": 1000,
+                "output_tokens": 10,
+                "total_tokens": 1010,
+                "input_tokens_details": {"cached_tokens": 900},
+            },
+            100,
+        ),
+    ],
+)
+async def test_async_log_success_event_subtracts_cache_reads_only_from_a_count_that_holds_them(usage_block, expected):
+    """A usage dict is read in its own shape, so cache reads come off a prompt count that includes
+    them and never off Anthropic's input_tokens, which does not."""
+    model = "test-usage-dict"
+    handler, increments = _success_event_handler(model, "input")
+
+    await _log_success(handler, model, {"usage": usage_block})
+
+    assert [amount for _, amount in increments] == [expected, expected]
+    reconciled = handler.v3_limiter._resolve_io_token_reconcile_usage({"usage": usage_block})
+    assert reconciled == (expected, 10, True)

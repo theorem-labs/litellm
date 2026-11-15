@@ -10,7 +10,7 @@ from typing import TYPE_CHECKING, Final, Literal
 from fastapi import HTTPException
 
 import litellm
-from litellm import ModelResponse, Router
+from litellm import Router
 from litellm._internal_context import with_service_target
 from litellm._logging import verbose_proxy_logger
 from litellm.caching.caching import DualCache
@@ -692,7 +692,6 @@ class _PROXY_DynamicRateLimitHandlerV3(CustomLogger):
         from litellm.proxy.common_utils.callback_utils import (
             get_model_group_from_litellm_kwargs,
         )
-        from litellm.types.utils import Usage
 
         try:
             verbose_proxy_logger.debug("INSIDE dynamic rate limiter ASYNC SUCCESS LOGGING")
@@ -713,19 +712,17 @@ class _PROXY_DynamicRateLimitHandlerV3(CustomLogger):
             user_api_key_auth_metadata: Final = standard_logging_metadata.get("user_api_key_auth_metadata") or {}
             key_priority: Final[str | None] = user_api_key_auth_metadata.get("priority")
 
-            # Get total tokens from response
-            total_tokens = 0
+            # Count tokens as the v3 limiter counts them for the same token_rate_limit_type,
+            # so the saturation this hook reads and the priority counters it charges agree
+            # with the TPM windows: cache reads are left out of input and total, as
+            # providers' input-token limits leave them out (Anthropic counts new input
+            # plus cache writes). A /v1/messages call reaches this hook as the ModelResponse
+            # its logging builds, whose prompt_tokens holds cache reads and writes.
             rate_limit_type: Final = self.v3_limiter.get_rate_limit_type()
-
-            if isinstance(response_obj, ModelResponse):
-                _usage: Final = getattr(response_obj, "usage", None)
-                if _usage and isinstance(_usage, Usage):
-                    if rate_limit_type == "output":
-                        total_tokens = _usage.completion_tokens
-                    elif rate_limit_type == "input":
-                        total_tokens = _usage.prompt_tokens
-                    elif rate_limit_type == "total":
-                        total_tokens = _usage.total_tokens
+            total_tokens: Final = self.v3_limiter._get_total_tokens_from_usage(
+                usage=self.v3_limiter._response_usage(response_obj),
+                rate_limit_type=rate_limit_type,
+            )
 
             if total_tokens == 0:
                 return

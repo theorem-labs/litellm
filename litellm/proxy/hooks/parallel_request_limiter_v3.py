@@ -153,6 +153,51 @@ class _ReconciledUsage:
         return max(0, self.prompt_tokens - self.cached_tokens)
 
 
+def _openai_shaped_usage(usage: Mapping[str, object]) -> Mapping[str, object]:
+    """A usage mapping in the OpenAI shape this module reads.
+
+    Anthropic's own usage block reports ``input_tokens`` without cache reads or cache
+    writes, and ``cache_read_input_tokens`` and ``cache_creation_input_tokens`` beside
+    it, where an OpenAI-shaped ``prompt_tokens`` holds all three and
+    ``prompt_tokens_details.cached_tokens`` names the cache reads among them. Read
+    as it stands, an Anthropic block would have its cache reads subtracted from a
+    number that never held them, and its cache writes, which Anthropic's input
+    limit counts, left out. A Responses API usage block has no ``prompt_tokens``
+    either: its ``input_tokens`` holds the cached tokens that
+    ``input_tokens_details.cached_tokens`` names, as ``prompt_tokens`` does. Any
+    other mapping is returned as it is.
+    """
+    if "prompt_tokens" in usage:
+        return usage
+    raw_input: Final = usage.get("input_tokens")
+    raw_output: Final = usage.get("output_tokens")
+    input_tokens: Final = raw_input if isinstance(raw_input, int) else 0
+    output_tokens: Final = raw_output if isinstance(raw_output, int) else 0
+    cache_read: Final = usage.get("cache_read_input_tokens")
+    cache_write: Final = usage.get("cache_creation_input_tokens")
+    if cache_read is not None or cache_write is not None:
+        read_tokens: Final = cache_read if isinstance(cache_read, int) else 0
+        write_tokens: Final = cache_write if isinstance(cache_write, int) else 0
+        anthropic_prompt_tokens: Final = input_tokens + write_tokens + read_tokens
+        return {
+            "prompt_tokens": anthropic_prompt_tokens,
+            "completion_tokens": output_tokens,
+            "total_tokens": anthropic_prompt_tokens + output_tokens,
+            "prompt_tokens_details": {"cached_tokens": read_tokens},
+        }
+    if raw_input is None:
+        return usage
+    input_details: Final = usage.get("input_tokens_details")
+    raw_cached: Final = input_details.get("cached_tokens") if isinstance(input_details, dict) else None
+    raw_total: Final = usage.get("total_tokens")
+    return {
+        "prompt_tokens": input_tokens,
+        "completion_tokens": output_tokens,
+        "total_tokens": raw_total if isinstance(raw_total, int) else input_tokens + output_tokens,
+        "prompt_tokens_details": {"cached_tokens": raw_cached if isinstance(raw_cached, int) else 0},
+    }
+
+
 @dataclass(frozen=True, slots=True)
 class RateLimitedModel:
     requested: str
@@ -4117,17 +4162,19 @@ class _PROXY_MaxParallelRequestsHandler_v3(CustomLogger):
                         cached_tokens = getattr(usage.prompt_tokens_details, "cached_tokens", 0) or 0
 
             elif isinstance(usage, dict):
-                # Responses API usage comes as a dict
+                # Responses API usage comes as a dict, and so does Anthropic's own usage
+                # block, which _openai_shaped_usage reads as OpenAI-shaped counts.
+                shaped: Final = _openai_shaped_usage(usage)
                 if rate_limit_type == "output":
-                    total_tokens = usage.get("completion_tokens", 0) or 0
+                    total_tokens = shaped.get("completion_tokens", 0) or 0
                 elif rate_limit_type == "input":
-                    total_tokens = usage.get("prompt_tokens", 0) or 0
+                    total_tokens = shaped.get("prompt_tokens", 0) or 0
                 elif rate_limit_type == "total":
-                    total_tokens = usage.get("total_tokens", 0) or 0
+                    total_tokens = shaped.get("total_tokens", 0) or 0
 
                 # Get cached tokens from dict
                 if rate_limit_type in ("input", "total"):
-                    prompt_details: Final = usage.get("prompt_tokens_details") or {}
+                    prompt_details: Final = shaped.get("prompt_tokens_details") or {}
                     if isinstance(prompt_details, dict):
                         cached_tokens = prompt_details.get("cached_tokens", 0) or 0
 
@@ -4384,14 +4431,19 @@ class _PROXY_MaxParallelRequestsHandler_v3(CustomLogger):
             )
 
         if isinstance(usage, Mapping):
-            raw_prompt_tokens: Final = usage.get("prompt_tokens") or usage.get("input_tokens") or 0
-            raw_completion_tokens: Final = usage.get("completion_tokens") or usage.get("output_tokens") or 0
+            shaped_usage: Final = _openai_shaped_usage(usage)
+            raw_prompt_tokens: Final = shaped_usage.get("prompt_tokens") or shaped_usage.get("input_tokens") or 0
+            raw_completion_tokens: Final = (
+                shaped_usage.get("completion_tokens") or shaped_usage.get("output_tokens") or 0
+            )
             mapped_prompt_tokens: Final = raw_prompt_tokens if isinstance(raw_prompt_tokens, int) else 0
             mapped_completion_tokens: Final = raw_completion_tokens if isinstance(raw_completion_tokens, int) else 0
-            prompt_details: Final = usage.get("prompt_tokens_details") or usage.get("input_tokens_details")
+            prompt_details: Final = shaped_usage.get("prompt_tokens_details") or shaped_usage.get(
+                "input_tokens_details"
+            )
             raw_cached_tokens: Final = (
                 (prompt_details.get("cached_tokens", 0) if isinstance(prompt_details, dict) else 0)
-                or usage.get("cache_read_input_tokens")
+                or shaped_usage.get("cache_read_input_tokens")
                 or 0
             )
             mapped_cached_tokens: Final = raw_cached_tokens if isinstance(raw_cached_tokens, int) else 0
